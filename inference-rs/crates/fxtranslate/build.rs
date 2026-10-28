@@ -94,6 +94,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=XSIMD_INCLUDE_DIR");
 
     let mut build = cc::Build::new();
+    // MSVC ignores `-mavx2` (warning D9002), so the shim would be built without
+    // AVX2 and fail; it spells the flag `/arch:AVX2`.
+    let arch_flag = if arch == "x86_64" && build.get_compiler().is_like_msvc() {
+        "/arch:AVX2"
+    } else {
+        arch_flag
+    };
     build
         .cpp(true)
         .std("c++17")
