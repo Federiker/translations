@@ -37,9 +37,42 @@ mod imp {
         fn gemmology_gemm_threads() -> usize;
     }
 
+    /// Whether this CPU can run the kernel the shim was compiled for. The shim is
+    /// built with AVX2 (x86_64) or i8mm (aarch64) unconditionally, so on a CPU
+    /// without them (an x86-64 PC from before about 2013, an Apple M1) nothing
+    /// may call into it: [`PreparedB::new`] then returns `None` and every caller
+    /// uses the scalar kernel. MSVC's `/arch:AVX2` may also emit FMA, hence the
+    /// second check. Setting `FXTRANSLATE_SCALAR` forces the scalar kernel, to
+    /// try that path on a CPU that has the features.
+    fn supported() -> bool {
+        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            if std::env::var_os("FXTRANSLATE_SCALAR").is_some() {
+                return false;
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma")
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                std::arch::is_aarch64_feature_detected!("i8mm")
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                false
+            }
+        })
+    }
+
     /// Cores the intra-op GEMM pool will use (feature `gemm-threads` +
-    /// `FXT_GEMM_THREADS`): `1` = inert (sequential), `0` = feature not compiled.
+    /// `FXT_GEMM_THREADS`): `1` = inert (sequential), `0` = feature not compiled
+    /// or the CPU cannot run the kernel.
     pub fn gemm_threads() -> usize {
+        if !supported() {
+            return 0;
+        }
         // SAFETY: reads a size from the shim; always valid.
         unsafe { gemmology_gemm_threads() }
     }
@@ -48,6 +81,9 @@ mod imp {
     /// allocations gemmology holds, which dhat (Rust-heap only) cannot see. For
     /// memory accounting.
     pub fn prepared_bytes() -> usize {
+        if !supported() {
+            return 0;
+        }
         // SAFETY: reads an atomic counter in the shim; always valid.
         unsafe { gemmology_prepared_bytes() }
     }
@@ -55,8 +91,12 @@ mod imp {
     /// The xsimd arch the SIMD kernel was compiled for ("i8mm+neon64", "avx2", …),
     /// read from the compiled shim itself. Lets callers and CI prove which kernel
     /// is live rather than trusting it didn't silently fall back to scalar — the
-    /// scalar stub below reports "scalar" instead.
+    /// scalar stub below reports "scalar" instead, as does a CPU that cannot run
+    /// the compiled kernel.
     pub fn backend() -> &'static str {
+        if !supported() {
+            return "scalar";
+        }
         // SAFETY: the shim returns a pointer to a static, NUL-terminated string
         // (xsimd's `Arch::name()`), valid for the whole program.
         let name = unsafe { std::ffi::CStr::from_ptr(gemmology_backend_name()) };
@@ -78,13 +118,16 @@ mod imp {
     impl PreparedB {
         /// Prepare a logical transposed int8 weight `[n, k]`. Returns `None` if
         /// `k` is not a multiple of the int8 SIMD register width (16 on i8mm/NEON,
-        /// 32 on AVX2, 64 on AVX-512), in which case the caller uses the scalar
-        /// kernel.
+        /// 32 on AVX2, 64 on AVX-512) or the CPU cannot run the compiled kernel
+        /// (see [`supported`]), in which case the caller uses the scalar kernel.
         ///
         /// # Panics
         /// If `b_transposed.len() != n * k`.
         pub fn new(b_transposed: &[i8], n: usize, k: usize) -> Option<PreparedB> {
             assert_eq!(b_transposed.len(), n * k, "B length must be n * k");
+            if !supported() {
+                return None;
+            }
             // SAFETY: pointer/len are consistent with (n, k); the shim only reads
             // n*k bytes and copies them into its own buffer.
             let handle = unsafe { gemmology_prepare_b(b_transposed.as_ptr(), n, k) };
