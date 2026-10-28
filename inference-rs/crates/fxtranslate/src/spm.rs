@@ -294,21 +294,50 @@ impl SpmVocab {
     }
 
     /// Decode token ids back to text: concatenate pieces, turn `▁` into spaces,
-    /// strip the leading space, and skip control/unknown pieces.
+    /// strip the leading space, and skip control/unknown pieces. Byte-fallback
+    /// pieces (`<0xC2><0xAB>`) become the characters their bytes encode (`«`).
     pub fn decode(&self, ids: &[u32]) -> String {
-        let mut out = String::new();
+        let (raw, _) = self.concat_pieces(ids);
+        raw.replace(SPACE, " ").trim_start().to_string()
+    }
+
+    /// Concatenate the pieces of `ids`, returning the text and each id's byte
+    /// range in it. Control and unknown pieces add nothing. A run of byte pieces
+    /// is decoded as UTF-8, as SentencePiece does: each character goes to the id
+    /// of its last byte (the run's earlier ids get an empty range), and bytes
+    /// that are not valid UTF-8 become U+FFFD.
+    fn concat_pieces(&self, ids: &[u32]) -> (String, Vec<Range<usize>>) {
+        let mut raw = String::new();
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(ids.len());
+        let mut pending: Vec<u8> = Vec::new();
         for &id in ids {
             let t = self
                 .types
                 .get(id as usize)
                 .copied()
                 .unwrap_or(PieceType::Normal);
-            if t == PieceType::Control || t == PieceType::Unknown {
-                continue;
+            let start = raw.len();
+            if t == PieceType::Byte {
+                if let Some(b) = parse_byte_piece(self.piece(id)) {
+                    pending.push(b);
+                    take_utf8(&mut raw, &mut pending, false);
+                    ranges.push(start..raw.len());
+                    continue;
+                }
             }
-            out.push_str(self.piece(id));
+            take_utf8(&mut raw, &mut pending, true);
+            if !(t == PieceType::Control || t == PieceType::Unknown) {
+                raw.push_str(self.piece(id));
+            }
+            ranges.push(start..raw.len());
         }
-        out.replace(SPACE, " ").trim_start().to_string()
+        if !pending.is_empty() {
+            take_utf8(&mut raw, &mut pending, true);
+            if let Some(last) = ranges.last_mut() {
+                last.end = raw.len();
+            }
+        }
+        (raw, ranges)
     }
 
     /// Like [`decode`](Self::decode), but also returns each input id's byte range
@@ -323,20 +352,7 @@ impl SpmVocab {
     /// so the ranges tile the output in order.
     pub fn decode_with_offsets(&self, ids: &[u32]) -> (String, Vec<Range<usize>>) {
         // Build the raw concatenation and each id's byte range within it.
-        let mut raw = String::new();
-        let mut raw_ranges: Vec<Range<usize>> = Vec::with_capacity(ids.len());
-        for &id in ids {
-            let start = raw.len();
-            let t = self
-                .types
-                .get(id as usize)
-                .copied()
-                .unwrap_or(PieceType::Normal);
-            if !(t == PieceType::Control || t == PieceType::Unknown) {
-                raw.push_str(self.piece(id));
-            }
-            raw_ranges.push(start..raw.len());
-        }
+        let (raw, raw_ranges) = self.concat_pieces(ids);
 
         // Rewrite `▁` (3 bytes) → " " (1 byte), building a map from each raw byte
         // offset to its offset in the converted (pre-trim) string. `conv[b]` =
@@ -555,6 +571,38 @@ fn parse_byte_piece(piece: &str) -> Option<u8> {
     u8::from_str_radix(hex, 16).ok()
 }
 
+/// Move the complete UTF-8 characters at the start of `pending` into `out`,
+/// writing U+FFFD for each invalid sequence. An incomplete character at the end
+/// is kept for the next byte unless `finished`, when it becomes U+FFFD too.
+fn take_utf8(out: &mut String, pending: &mut Vec<u8>, finished: bool) {
+    while !pending.is_empty() {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or_default());
+                match e.error_len() {
+                    Some(bad) => {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                        pending.drain(..valid + bad);
+                    }
+                    None if finished => {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                        pending.clear();
+                    }
+                    None => {
+                        pending.drain(..valid);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Byte length of the valid UTF-8 char at the start of `b`, or `None` if it is
 /// malformed (bad lead byte or truncated/invalid continuation).
 fn utf8_char_len(b: &[u8]) -> Option<usize> {
@@ -721,6 +769,46 @@ mod tests {
         assert_eq!(&text[ranges[3].clone()], " world");
         // Ranges tile the output contiguously in order.
         assert_eq!(ranges[3].end, text.len());
+    }
+
+    #[test]
+    fn decode_reassembles_byte_pieces() {
+        // «Ciao» with « and » spelled as byte-fallback pieces, plus a stray
+        // continuation byte and a truncated character, which become U+FFFD.
+        let vocab = SpmVocab {
+            pieces: vec![
+                "<0xC2>".into(),
+                "<0xAB>".into(),
+                "<0xBB>".into(),
+                "\u{2581}Ciao".into(),
+            ],
+            types: vec![
+                PieceType::Byte,
+                PieceType::Byte,
+                PieceType::Byte,
+                PieceType::Normal,
+            ],
+            scores: vec![0.0; 4],
+            by_piece: HashMap::new(),
+            eos_id: 0,
+            unk_id: 0,
+            max_piece_bytes: 8,
+            min_score: 0.0,
+            normalizer: Normalizer::from_spec(&[]),
+            byte_pieces: Box::new([None; 256]),
+        };
+        let ids = [3u32, 0, 1, 3, 0, 2];
+        assert_eq!(vocab.decode(&ids), "Ciao« Ciao»");
+        let (text, ranges) = vocab.decode_with_offsets(&ids);
+        assert_eq!(text, vocab.decode(&ids));
+        assert_eq!(ranges.len(), ids.len());
+        assert_eq!(&text[ranges[1].clone()], "");
+        assert_eq!(&text[ranges[2].clone()], "«");
+        assert_eq!(ranges.last().map(|r| r.end), Some(text.len()));
+
+        assert_eq!(vocab.decode(&[2, 3]), "\u{FFFD} Ciao");
+        assert_eq!(vocab.decode(&[3, 0]), "Ciao\u{FFFD}");
+        assert_eq!(vocab.decode(&[0, 3]), "\u{FFFD} Ciao");
     }
 
     #[test]
